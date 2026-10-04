@@ -15,6 +15,8 @@
  *              "claude-db" → Claude 아티팩트 db 방식 앱
  *              (없으면)    → localStorage 방식 앱
  *  data-skip : 클라우드에 올리지 않을 저장 이름 앞부분(자동 백업 등)
+ *  data-idb  : 사진·영상처럼 IndexedDB에 따로 저장하는 것도 클라우드에 맞추기 ("DB이름/칸;DB이름/칸")
+ *              사진은 줄여서 올리고, 영상은 잘게 나눠서 올린다. 다른 기기는 처음 한 번만 받아서 기기에 넣어 둔다.
  *  data-legacy-idb / data-legacy-ls : storage 방식에서 예전 기기 저장소(이름/칸, 앞부분)에서 처음 한 번 옮겨 올 곳
  * ===================================================================== */
 (function(){
@@ -29,6 +31,7 @@
   var KEYS = String(attr("keys", "")).split(",").map(function(s){ return s.trim(); }).filter(Boolean);
   var SKIP = String(attr("skip", "")).split(",").map(function(s){ return s.trim(); }).filter(Boolean);
   var LEG_IDB = String(attr("legacy-idb", "")), LEG_LS = String(attr("legacy-ls", ""));
+  var IDBS = String(attr("idb", "")).split(";").map(function(s){ s = s.trim(); var p = s.split("/"); return p.length === 2 ? { db: p[0], st: p[1] } : null; }).filter(Boolean);
   var PUBLIC = APP.indexOf("pub_") === 0;
   var ADMIN = "schp2223@gmail.com";
   var ROOT = "apps/" + APP;
@@ -260,7 +263,7 @@
     db.ref(ROOT + "/updatedAt").on("value", function(s){
       var t = s.val(); if (!t || Date.now() - lastPush < 6000) return;
       if (watchLocal.first){ watchLocal.first = false; return; }
-      pullLocal(false);
+      pullLocal(false).then(function(){ return xSync(false); });
     });
     watchLocal.first = true;
   }
@@ -429,6 +432,144 @@
     });
   }
 
+  /* =================== 사진·영상 (IndexedDB) 같이 맞추기 =================== */
+  var X = { syncing: false, pending: {}, timer: null, sig: {}, busy: false, ready: false };
+  try { X.sig = JSON.parse(ls.getItem("__jdc_idbsig_" + APP) || "{}") || {}; } catch(e){ X.sig = {}; }
+  function xSaveSig(){ try { Storage.prototype.setItem.call(ls, "__jdc_idbsig_" + APP, JSON.stringify(X.sig)); } catch(e){} }
+  function xId(db, st, k){ return enc(db) + "/" + enc(st) + "/" + enc(String(k)); }
+  function isBlob(v){ return typeof Blob !== "undefined" && v instanceof Blob; }
+  function strSig(s){ var hsh = 5381, n = s.length, step = Math.max(1, Math.floor(n / 4000)); for (var i = 0; i < n; i += step){ hsh = ((hsh << 5) + hsh + s.charCodeAt(i)) | 0; } return "s" + n + ":" + hsh; }
+  function sigOf(v){ if (v == null) return "x"; if (isBlob(v)) return "b" + v.size + ":" + (v.type || ""); if (typeof v === "string") return strSig(v); try { return strSig(JSON.stringify(v)); } catch(e){ return "?"; } }
+  function xWatched(store){ try { var dn = store.transaction.db.name, sn = store.name; for (var i = 0; i < IDBS.length; i++){ if (IDBS[i].db === dn && IDBS[i].st === sn) return IDBS[i]; } } catch(e){} return null; }
+  if (IDBS.length && typeof IDBObjectStore !== "undefined"){
+    var oPut = IDBObjectStore.prototype.put, oDel = IDBObjectStore.prototype["delete"];
+    IDBObjectStore.prototype.put = function(v, k){
+      var r = oPut.apply(this, arguments);
+      if (!X.syncing){ var w = xWatched(this); if (w){ var key = k !== undefined ? k : (this.keyPath && v ? v[this.keyPath] : undefined); if (key !== undefined){ X.pending[xId(w.db, w.st, key)] = { w: w, k: key, v: v }; xSchedule(); } } }
+      return r;
+    };
+    IDBObjectStore.prototype["delete"] = function(k){
+      var r = oDel.apply(this, arguments);
+      if (!X.syncing){ var w = xWatched(this); if (w && (typeof k === "string" || typeof k === "number")){ X.pending[xId(w.db, w.st, k)] = { w: w, k: k, v: null, del: true }; xSchedule(); } }
+      return r;
+    };
+  }
+  function xSchedule(){ clearTimeout(X.timer); X.timer = setTimeout(xFlush, 1500); }
+  function xOpen(w){
+    return new Promise(function(res){
+      var done = false, fin = function(v){ if (!done){ done = true; res(v); } };
+      try {
+        var r = indexedDB.open(w.db);
+        r.onupgradeneeded = function(){ try { if (!r.result.objectStoreNames.contains(w.st)) r.result.createObjectStore(w.st); } catch(e){} };
+        r.onsuccess = function(){ var d = r.result; if (!d.objectStoreNames.contains(w.st)){ d.close(); fin(null); return; } fin(d); };
+        r.onerror = function(){ fin(null); }; setTimeout(function(){ fin(null); }, 6000);
+      } catch(e){ fin(null); }
+    });
+  }
+  function xPutLocal(w, k, v){
+    return xOpen(w).then(function(d){
+      if (!d) return false;
+      return new Promise(function(res){
+        try { X.syncing = true; var tx = d.transaction(w.st, "readwrite"); if (v == null) tx.objectStore(w.st)["delete"](k); else tx.objectStore(w.st).put(v, k); X.syncing = false;
+          tx.oncomplete = function(){ d.close(); res(true); }; tx.onerror = function(){ d.close(); res(false); };
+        } catch(e){ X.syncing = false; try { d.close(); } catch(_){} res(false); }
+      });
+    });
+  }
+  function shrinkImage(s){
+    return new Promise(function(res){
+      if (typeof s !== "string" || s.indexOf("data:image/") !== 0 || s.length < 350000) { res(s); return; }
+      var im = new Image();
+      im.onload = function(){ try { var m = 1280, sc = Math.min(1, m / Math.max(im.naturalWidth, im.naturalHeight)); var c = document.createElement("canvas"); c.width = Math.round(im.naturalWidth * sc); c.height = Math.round(im.naturalHeight * sc); c.getContext("2d").drawImage(im, 0, 0, c.width, c.height); var o = c.toDataURL("image/jpeg", 0.8); res(o.length < s.length ? o : s); } catch(e){ res(s); } };
+      im.onerror = function(){ res(s); }; im.src = s;
+    });
+  }
+  function blobToData(b){ return new Promise(function(res, rej){ var r = new FileReader(); r.onload = function(){ res(r.result); }; r.onerror = rej; r.readAsDataURL(b); }); }
+  function xUpload(id, w, k, v){
+    var base = ROOT + "/idb/" + id, sg = sigOf(v);
+    if (v == null){
+      var up = {}; up[base] = { t: "x", ts: Date.now() }; up[ROOT + "/idbblob/" + id] = null; up[ROOT + "/updatedAt"] = firebase.database.ServerValue.TIMESTAMP;
+      lastPush = Date.now(); return db.ref().update(up).then(function(){ X.sig[id] = "x"; xSaveSig(); });
+    }
+    if (X.sig[id] === sg) return Promise.resolve();
+    if (isBlob(v)){
+      if (v.size > 60 * 1024 * 1024){ bar("영상이 60MB가 넘어서 클라우드에 올리지 않았어요. 더 짧게 잘라서 넣어 주세요"); return Promise.resolve(); }
+      return blobToData(v).then(function(du){
+        var CH = 900000, n = Math.ceil(du.length / CH), i = 0;
+        var next = function(){
+          if (i >= n) return Promise.resolve();
+          setPill("warn", "영상 올리는 중 " + Math.round(i / n * 100) + "%");
+          return db.ref(ROOT + "/idbblob/" + id + "/c" + i).set(du.slice(i * CH, (i + 1) * CH)).then(function(){ i++; return next(); });
+        };
+        return db.ref(ROOT + "/idbblob/" + id).remove().then(next).then(function(){
+          var up = {}; up[base] = { t: "b", type: v.type || "", name: v.name || "", size: v.size, n: n, sig: sg, ts: Date.now() }; up[ROOT + "/updatedAt"] = firebase.database.ServerValue.TIMESTAMP;
+          lastPush = Date.now(); return db.ref().update(up);
+        }).then(function(){ X.sig[id] = sg; xSaveSig(); flash("영상을 클라우드에 올렸어요"); });
+      });
+    }
+    return shrinkImage(typeof v === "string" ? v : JSON.stringify(v)).then(function(s){
+      var up = {}; up[base] = { t: typeof v === "string" ? "s" : "j", v: s, sig: sg, ts: Date.now() }; up[ROOT + "/updatedAt"] = firebase.database.ServerValue.TIMESTAMP;
+      lastPush = Date.now(); return db.ref().update(up).then(function(){ X.sig[id] = sg; xSaveSig(); });
+    });
+  }
+  function xFlush(){
+    if (!db || !allowed || !X.ready || X.busy){ if (Object.keys(X.pending).length) X.timer = setTimeout(xFlush, 4000); return; }
+    var ids = Object.keys(X.pending); if (!ids.length) return;
+    X.busy = true; var jobs = ids.map(function(id){ var p = X.pending[id]; delete X.pending[id]; return function(){ return xUpload(id, p.w, p.k, p.v); }; });
+    jobs.reduce(function(pr, fn){ return pr.then(fn); }, Promise.resolve())
+      .then(function(){ flash("사진·영상까지 클라우드에 저장됨"); })
+      .catch(function(){ setPill("err", "사진·영상 저장 실패. 다시 시도해요"); })
+      .then(function(){ X.busy = false; if (Object.keys(X.pending).length) xSchedule(); });
+  }
+  function xReadAll(w){
+    return xOpen(w).then(function(d){
+      if (!d) return {};
+      return new Promise(function(res){ var out = {}; try { var q = d.transaction(w.st, "readonly").objectStore(w.st).openCursor(); q.onsuccess = function(){ var c = q.result; if (c){ out[c.key] = c.value; c.continue(); } else { d.close(); res(out); } }; q.onerror = function(){ d.close(); res(out); }; } catch(e){ d.close(); res(out); } });
+    });
+  }
+  function xDownloadBlob(id, meta){
+    var parts = [], i = 0;
+    var next = function(){
+      if (i >= meta.n) return Promise.resolve();
+      setPill("warn", "영상 받는 중 " + Math.round(i / meta.n * 100) + "%");
+      return db.ref(ROOT + "/idbblob/" + id + "/c" + i).once("value").then(function(s){ parts.push(s.val() || ""); i++; return next(); });
+    };
+    return next().then(function(){ return fetch(parts.join("")); }).then(function(r){ return r.blob(); }).then(function(b){
+      try { if (meta.name && typeof File === "function") return new File([b], meta.name, { type: meta.type || b.type }); } catch(e){}
+      return b;
+    });
+  }
+  function xSync(first){
+    if (!IDBS.length || !db || !allowed) return Promise.resolve(0);
+    var changed = 0;
+    return IDBS.reduce(function(pr, w){
+      return pr.then(function(){
+        var pre = enc(w.db) + "/" + enc(w.st);
+        return Promise.all([timeout(db.ref(ROOT + "/idb/" + pre).once("value"), 20000, "__reject"), xReadAll(w)]).then(function(r){
+          var remote = r[0].val() || {}, local = r[1], jobs = [];
+          Object.keys(remote).forEach(function(ek){
+            var k = dec(ek), m = remote[ek] || {}, id = pre + "/" + ek, lv = local[k];
+            if (m.t === "x"){ if (lv != null){ jobs.push(function(){ return xPutLocal(w, k, null).then(function(){ changed++; X.sig[id] = "x"; }); }); } return; }
+            var lsig = lv == null ? null : sigOf(lv);
+            if (lsig === m.sig || (lsig && X.sig[id] === lsig && lsig !== m.sig && false)) { X.sig[id] = m.sig; return; }
+            if (lv != null && X.sig[id] === lsig){ /* 이 기기에서 바꾸지 않았는데 클라우드가 바뀜 → 받기 */ }
+            else if (lv != null && X.sig[id] !== lsig && X.sig[id] !== undefined){ X.pending[id] = { w: w, k: k, v: lv }; return; } // 이 기기에서 새로 바꾼 것 → 올리기
+            jobs.push(function(){
+              var get = m.t === "b" ? xDownloadBlob(id, m) : Promise.resolve(m.t === "j" ? JSON.parse(m.v) : m.v);
+              return get.then(function(v){ return xPutLocal(w, k, v).then(function(ok){ if (ok){ changed++; X.sig[id] = m.sig; } }); });
+            });
+          });
+          Object.keys(local).forEach(function(k){ var id = pre + "/" + enc(String(k)); if (!(enc(String(k)) in remote)) X.pending[id] = { w: w, k: k, v: local[k] }; });
+          return jobs.reduce(function(p2, fn){ return p2.then(fn); }, Promise.resolve());
+        });
+      });
+    }, Promise.resolve()).then(function(){
+      xSaveSig(); X.ready = true; if (Object.keys(X.pending).length) xSchedule();
+      if (changed){ if (first){ if (!reloadOnce()) flash("사진·영상을 받아 왔어요"); } else bar("다른 기기에서 사진·영상을 받았어요", "화면 새로 보기", function(){ location.reload(); }); }
+      return changed;
+    }).catch(function(){ X.ready = true; setPill("err", "사진·영상을 맞추지 못했어요"); return 0; });
+  }
+
   /* =================== 출석부처럼 db 방식으로 만든 앱 =================== */
   var ready = new Promise(function(res){ api._ready = res; });
   function rtdbStore(){
@@ -556,13 +697,17 @@
           api.started = true;
           return;
         }
+        if (!allowed && !PUBLIC){
+          var nk = "__jdc_nudge_" + APP, off = false; try { off = !!sessionStorage.getItem(nk); } catch(e){}
+          if (!off) setTimeout(function(){ if (allowed) return; bar("관장님 로그인하면 이 기록이 클라우드에 저장돼서 다른 기기에서도 그대로 보여요", "로그인", login); try { sessionStorage.setItem(nk, "1"); } catch(e){} }, 1500);
+        }
         if (MODE === "storage"){
-          if (allowed){ setPill("warn", "클라우드와 맞추는 중"); sInit.then(function(){ return pullS(true); }); if (!was) watchS(); }
+          if (allowed){ setPill("warn", "클라우드와 맞추는 중"); sInit.then(function(){ return pullS(true); }).then(function(){ return xSync(true); }); if (!was) watchS(); }
           else { setPill("warn", "로그인하면 클라우드 저장"); if (S._pullDone) S._pullDone(); }
           return;
         }
         if (!KEYS.length){ setPill("err", "저장 이름(data-keys)이 없어요"); return; }
-        if (allowed){ setPill("warn", "클라우드와 맞추는 중"); pullLocal(true); if (!was) watchLocal(); }
+        if (allowed){ setPill("warn", "클라우드와 맞추는 중"); pullLocal(true).then(function(){ return xSync(true); }); if (!was) watchLocal(); }
         else setPill("warn", "로그인하면 클라우드 저장");
       });
     }).catch(function(){
