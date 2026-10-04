@@ -78,6 +78,7 @@
       "#jdc-pill{position:fixed;left:10px;bottom:calc(10px + env(safe-area-inset-bottom,0px));z-index:2147483000;display:flex;align-items:center;gap:6px;border:0;border-radius:999px;background:rgba(17,18,22,.82);color:#fff;font:700 12px/1 'Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif;padding:7px 11px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25);transition:transform 120ms ease-out}" +
       "#jdc-pill:active{transform:scale(.94)}" +
       "#jdc-pill i{width:8px;height:8px;border-radius:50%;background:#9aa0ad;display:block}" +
+      "#jdc-pill.mini{padding:7px;opacity:.75}#jdc-pill.mini span{display:none}" +
       "#jdc-pill.ok i{background:#3ccf6b}#jdc-pill.warn i{background:#ffbf3c}#jdc-pill.err i{background:#ff5a5a}" +
       "#jdc-panel{position:fixed;left:10px;bottom:calc(52px + env(safe-area-inset-bottom,0px));z-index:2147483001;width:min(330px,calc(100vw - 20px));background:#fff;color:#111216;border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.3);padding:16px;font:14px/1.55 'Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif}" +
       "#jdc-panel b.t{display:block;font-size:16px;margin-bottom:4px}" +
@@ -108,6 +109,8 @@
     if (!ui.pill) return;
     ui.pill.className = state === "ok" ? "ok" : state === "warn" ? "warn" : state === "err" ? "err" : "";
     ui.pill.querySelector("span").textContent = msg || "클라우드";
+    clearTimeout(setPill.mt); ui.pill.classList.remove("mini");
+    if (state !== "warn" || /로그인/.test(msg || "")) setPill.mt = setTimeout(function(){ if (ui.panel.classList.contains("jdc-hide")) ui.pill.classList.add("mini"); }, 6000);
     if (ui.panel && !ui.panel.classList.contains("jdc-hide")) renderPanel();
   }
   function flash(msg){ setPill("ok", msg); clearTimeout(flash.t); flash.t = setTimeout(function(){ if (api.state === "ok") setPill("ok", "클라우드 저장 켜짐"); }, 2200); }
@@ -677,6 +680,8 @@
     buildUI();
     if (!window.Promise){ setPill("err", "이 브라우저는 클라우드를 못 써요"); return; }
     var hasApp = typeof window.firebase !== "undefined" && typeof window.firebase.initializeApp === "function";
+    // 앱이 이미 Firebase를 쓰고 있으면(끝말잇기 대전 등) 같은 버전으로 맞춰서 불러온다
+    if (hasApp && window.firebase.SDK_VERSION) SDK = "https://www.gstatic.com/firebasejs/" + window.firebase.SDK_VERSION + "/";
     var p = (hasApp ? Promise.resolve() : loadScript(SDK + "firebase-app-compat.js")).then(function(){
       var need = [];
       if (typeof firebase.auth !== "function") need.push(loadScript(SDK + "firebase-auth-compat.js"));
@@ -691,6 +696,8 @@
         if (u && u.email !== ADMIN){ bar(u.email + " 계정은 관리자 권한이 없어요"); auth.signOut(); return; }
         var was = allowed;
         allowed = PUBLIC || !!(u && u.email === ADMIN);
+        api.isAdmin = !!(u && u.email === ADMIN);
+        try { window.dispatchEvent(new CustomEvent("jdcloud-auth", { detail: { admin: api.isAdmin } })); } catch(e){}
         if (MODE === "claude-db"){
           if (allowed){ api._ready(true); setPill("ok", "클라우드 저장 켜짐"); if (!was) watchDb(); if (!was && api.started) { if (!reloadOnce()) {} } }
           else { api._ready(false); setPill("warn", "로그인하면 클라우드 저장"); }
